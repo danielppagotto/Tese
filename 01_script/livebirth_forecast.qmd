@@ -1,0 +1,215 @@
+---
+title: "Forecasting live births"
+format: html
+editor: visual
+---
+
+This script aims to describe the process of applying the method for forecasting the number of live births (LB) in each health macro-region in Brazil. To do this, we will use data from the Live Births System (SINASC, *Sistema de Nascidos Vivos*) provided by the SUS Information Technology Department (DATASUS) for each health macro-region.
+
+# Preparing R environment
+
+Loading libraries needed to forecast LB.
+
+```{r}
+#| warning: FALSE
+
+library(tidyverse)
+library(modeltime)
+library(RODBC)
+library(xgboost)
+library(tidymodels)
+library(timetk)
+library(patchwork)
+
+```
+
+# Data extraction
+
+We loaded the DATASUS data into our own infrastructure in order to access it using SQL, given the volume of data and the need to increase storage and processing efficiency.
+
+The script below performs the data access.
+
+```{r}
+#| warning: false
+
+dremio_host <- Sys.getenv("endereco")
+dremio_port <- Sys.getenv("port")
+dremio_uid <- Sys.getenv("uid")
+dremio_pwd <- Sys.getenv("datalake")
+
+channel <- 
+        odbcDriverConnect(
+                sprintf("DRIVER=Dremio Connector;
+                        HOST=%s;PORT=%s;UID=%s;PWD=%s;
+                        AUTHENTICATIONTYPE=Basic Authentication;
+                        CONNECTIONTYPE=Direct", 
+                        dremio_host, dremio_port, 
+                        dremio_uid, dremio_pwd))
+
+query <- 'SELECT * 
+            FROM "Analytics Layer"."Epidemiológico".Nascimentos."Nascidos vivos por macrorregião de saúde"'
+
+lb <- sqlQuery(channel, 
+                  query, 
+                  as.is = TRUE)
+
+```
+
+The SQL code used to create the query `'SELECT * FROM "Analytics Layer"."Epidemiológico".Nascimentos."Nascidos vivos por macrorregião de saúde"'` is presented below.
+
+``` sql
+
+WITH nascimentos_final 
+AS (
+    SELECT 
+        SUBSTR(CODMUNRES, 1, 6) AS CODUFMUN,
+        SUBSTR(DTNASC, 5, 4) AS ANO,
+        SUBSTR(DTNASC, 3, 2) AS MES,
+        COUNT(*) AS QUANTIDADE
+
+    FROM Dados.sinasc.DN
+    GROUP BY
+        SUBSTR(CODMUNRES, 1, 6),
+        SUBSTR(DTNASC, 5, 4),
+        SUBSTR(DTNASC, 3, 2)
+    ORDER BY
+        ANO, MES),
+
+nascimentos_preliminar 
+AS (
+    SELECT 
+        SUBSTR(CODMUNRES, 1, 6) AS CODUFMUN,
+        SUBSTR(DTNASC, 5, 4) AS ANO,
+        SUBSTR(DTNASC, 3, 2) AS MES,
+        COUNT(*) AS QUANTIDADE
+    FROM 
+        Dados.sinasc.preliminar
+    WHERE 
+      SUBSTR(DTNASC, 5, 4) > (SELECT MAX(SUBSTR(DTNASC, 5, 4)) 
+      FROM Dados.sinasc.DN)
+    GROUP BY
+        SUBSTR(CODMUNRES, 1, 6),
+        SUBSTR(DTNASC, 5, 4),
+        SUBSTR(DTNASC, 3, 2))
+
+SELECT
+    m.regiao,
+    m.uf_sigla,
+    m.cod_macrorregiao,
+    m.macrorregiao,
+    dn.ano,
+    dn.mes,
+    sum(quantidade) as quantidade
+FROM
+  (SELECT * FROM nascimentos_final
+   UNION ALL
+   SELECT * FROM nascimentos_preliminar) dn
+LEFT JOIN "Analytics Layer".Territorial."Municípios - Hierarquia Completa" m 
+  ON CAST(dn.CODUFMUN AS INT) = m.cod_municipio
+WHERE uf_sigla IS NOT NULL
+GROUP BY 
+    m.regiao,
+    m.uf_sigla,
+    m.cod_macrorregiao,
+    m.macrorregiao,
+    dn.ano,
+    dn.mes
+ORDER BY
+    ANO, MES 
+```
+
+```{r include=FALSE}
+
+# this chunk of code is used to transform our data formats before any analysis
+
+lb <- lb |> 
+        rename(br_region = regiao) |> 
+        rename(state = uf_sigla) |> 
+        rename(mc_code = cod_macrorregiao) |> 
+        rename(year = ano) |> 
+        rename(month = mes) |> 
+        rename(qtt = quantidade)
+
+
+lb$date <- as.Date(paste(lb$year, 
+                         lb$month, "1", 
+                         sep = "-"), 
+                   format = "%Y-%m-%d")
+
+lb$qtt <- as.numeric(lb$qtt)
+
+
+lb <- lb |> mutate(year = year(date))
+
+lb <- lb |> 
+        filter(date < "2023-01-01")
+
+```
+
+# A) Case Study for one macro-region
+
+First, we'll run the forecasting for just one health macro-region. Once we have consolidated this rationale, we can move on to automating the same steps for the other locations using functions. We randomly selected Centro-Sudeste health macro-region, which is located in the state of Goias, in the middle-west of Brazil.
+
+The code below is used to plot the number of LB between 2000 and the end of 2022 (the last year with definitive data). We can see that in recent years this macro-region has seen a downward trend in the number of live births. In addition, it can be seen that seasonality is generally present each year, with a higher number of LB in the first few months of the year.
+
+```{r}
+#| warning: false
+
+a <- lb |> 
+  filter(mc_code == "5210") |> 
+  ggplot(aes(x = date, y = qtt)) + 
+  geom_line() + geom_smooth(se = FALSE) + 
+  theme_minimal() + theme(legend.position = "bottom") + 
+  xlab("Date") + ylab("LB Total") + 
+  ggtitle("Evolution of LB - Centro-Sudeste(GO) macro-region")
+
+
+b <- lb |> 
+  filter(year == 2018 & mc_code == "5210") |> 
+  ggplot(aes(x = date, y = qtt)) + 
+  geom_line() + geom_smooth(se = FALSE) + 
+  theme_minimal() + theme(axis.text.x = 
+                            element_text(angle = 90, hjust = 1)) + 
+  xlab("Date") + ylab("LB Total") + ggtitle("2018")
+
+c <- lb |> 
+  filter(year == 2019 & mc_code == "5210") |> 
+  ggplot(aes(x = date, y = qtt)) + 
+  geom_line() + geom_smooth(se = FALSE) + 
+  theme_minimal() + theme(axis.text.x = 
+                            element_text(angle = 90, hjust = 1)) + 
+  xlab("Date") + ylab("LB Total") + ggtitle("2019")
+
+
+d <- lb |> 
+  filter(year == 2020 & mc_code == "5210") |> 
+  ggplot(aes(x = date, y = qtt)) + 
+  geom_line() + geom_smooth(se = FALSE) + 
+  theme_minimal() + theme(axis.text.x = 
+                            element_text(angle = 90, hjust = 1)) + 
+  xlab("Date") + ylab("LB Total") + ggtitle("2020")
+
+a / (b + c + d)
+
+```
+
+## 1) Time split
+
+Let's do a time split to divide the data set into two subsets: training and test.
+
+-   Training is a subset that supplies the algorithms;
+
+-   Test is a subset used to assess how well the algorithm's predictive output adheres to real values.
+
+80% of the data set will be used for training and 20% for testing.
+
+```{r}
+
+lb5210 <- lb |> filter(mc_code == "5210")
+  
+splits <- initial_time_split(lb5210, prop = 0.80)
+
+splits
+```
+
+## 2) Fit models
