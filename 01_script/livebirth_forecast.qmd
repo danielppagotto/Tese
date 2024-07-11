@@ -150,7 +150,7 @@ lb <- lb |>
 
 First, we'll run the forecasting for just one health macro-region. Once we have consolidated this rationale, we can move on to automating the same steps for the other locations using functions. We randomly selected Centro-Sudeste health macro-region, which is located in the state of Goias, in the middle-west of Brazil.
 
-The code below is used to plot the number of LB between 2000 and the end of 2022 (the last year with definitive data). We can see that in recent years this macro-region has seen a downward trend in the number of live births. In addition, it can be seen that seasonality is generally present each year, with a higher number of LB in the first few months of the year.
+The code below is used to plot the number of LB between 2000 and the end of 2022 (the last year with definitive data). We can see that in recent years this macro-region has seen a downward trend in the number of live births. In addition, it can be seen that seasonality is generally present each year, with a higher number of LB in the first few months, until may.
 
 ```{r}
 #| warning: false
@@ -213,3 +213,366 @@ splits
 ```
 
 ## 2) Fit models
+
+Nós construímos
+
+```{r}
+#| warning: false
+
+# Model 1: auto_arima ----
+model_fit_arima_no_boost <-
+    arima_reg() |>
+    set_engine(engine = "auto_arima") |>
+    fit(qtt ~ date, data = training(splits))
+
+
+# Model 2: arima_boost ----
+
+model_fit_arima_boosted <- 
+  arima_boost(
+    min_n = 2,
+    learn_rate = 0.015)  |> 
+    set_engine(engine = "auto_arima_xgboost") |> 
+    fit(qtt ~ date + 
+              as.numeric(date) + 
+              factor(month(date, 
+                           label = TRUE),
+                     ordered = F),
+        data = training(splits))
+
+# Model 3: ets ----
+model_fit_ets <- exp_smoothing() |>
+    set_engine(engine = "ets") |>
+    fit(qtt ~ date, data = training(splits))
+
+# Model 4: prophet ----
+model_fit_prophet <- prophet_reg() |>
+    set_engine(engine = "prophet") |>
+    fit(qtt ~ date, data = training(splits))
+
+
+# Model 5: lm ----
+model_fit_lm <- linear_reg() |>
+    set_engine("lm") |>
+    fit(qtt ~ as.numeric(date) + 
+                factor(month(date, 
+                             label = TRUE), 
+                       ordered = FALSE),
+        data = training(splits))
+
+# Model 6: earth ----
+
+model_spec_mars <- mars(mode = "regression") |>
+    set_engine("earth") 
+
+recipe_spec <- recipe(qtt ~ date, data = training(splits)) |>
+    step_date(date, features = "month", ordinal = FALSE) |>
+    step_mutate(date_num = as.numeric(date)) |>
+    step_normalize(date_num) |>
+    step_rm(date)
+  
+wflw_fit_mars <- workflow() |>
+    add_recipe(recipe_spec) |>
+    add_model(model_spec_mars) |>
+    fit(training(splits))
+
+
+models_tbl <- 
+  modeltime_table(
+    model_fit_arima_no_boost,
+    model_fit_arima_boosted,
+    model_fit_ets,
+    model_fit_prophet,
+    model_fit_lm,
+    wflw_fit_mars)
+
+models_tbl
+
+```
+
+Add fitted models to model table
+
+```{r}
+
+calibration_tbl <- 
+    models_tbl |>
+    modeltime_calibrate(new_data = 
+                          testing(splits))
+
+calibration_tbl |>
+    modeltime_forecast(
+        new_data  = testing(splits),
+        actual_data = lb5210) |>
+    plot_modeltime_forecast(.conf_interval_show = FALSE)
+```
+
+## 3) Model evaluation
+
+```{r}
+calibration_tbl |>
+    modeltime_accuracy() |>
+    table_modeltime_accuracy()
+
+min_mape <- calibration_tbl |> 
+                modeltime_accuracy() |> 
+                slice_min(mape, n = 1)
+
+?slice_min
+```
+
+adfa
+
+```{r}
+refit_tbl <- calibration_tbl |>
+    modeltime_refit(data = lb5210)
+
+refit_tbl |>
+    modeltime_forecast(h = "3 years", 
+                       actual_data = lb5210) |>
+    plot_modeltime_forecast(
+      .conf_interval_show = FALSE,
+      .legend_max_width = 25)
+
+x <- refit_tbl |> 
+  filter(.model_id == min_mape$.model_id) |> 
+  modeltime_forecast(h = "3 years", 
+                       actual_data = lb5210) |>
+    plot_modeltime_forecast(
+      .conf_interval_show = FALSE,
+      .legend_max_width = 25)
+
+date_i <- x[["x"]][["data"]][[1]][["x"]]
+qtt_i <- x[["x"]][["data"]][[1]][["y"]]   
+    
+date <- x[["x"]][["data"]][[2]][["x"]]
+qtt <- x[["x"]][["data"]][[2]][["y"]]
+
+state_region <- lb |> 
+                  filter(mc_code == "5208")
+
+state <- unique(state_region$state)
+region_name <- unique(state_region$macrorregiao)
+
+df_real <- tibble(mc_region = "5208",
+                  region_name = region_name,
+                  state = state,
+                  mape = "real data",
+                  id = "real data",
+                  desc = "real data",
+                  date = date_i,
+                  qtt = round(qtt_i))
+
+df_projection <- tibble(mc_region = "5208",
+                        region_name = region_name,
+                        state = state,
+                        mape = min_mape$mape,
+                        id = min_mape$.model_id,
+                        desc = min_mape$.model_desc,
+                        date,
+                        qtt)
+
+df <- rbind(df_real,
+            df_projection)
+
+graph <- 
+  df |> 
+  ggplot(aes(x = date, 
+             y = qtt, 
+             col = desc)) +
+  geom_line() + 
+  theme_minimal() + 
+  ggtitle(sprintf("Forecasting - %s - %s - %s", 
+                  region_name, state, reg)) +
+  theme(plot.background = element_rect(fill = "white", 
+                                       color = NA),
+        panel.background = element_rect(fill = "white", 
+                                        color = NA),
+        legend.position = "bottom")
+
+graph
+
+ggsave(filename = 
+       sprintf("Graph - %s.png", reg), plot = graph, 
+       path = "~/GitHub/Tese/Tese/01_script/graph",
+       width = 10, height = 5)
+
+
+```
+
+# B) Function to automate process
+
+Criando uma função para aplicar e manter o melhor modelo
+
+```{r}
+#| warning: FALSE
+
+best_model <- 
+  function(mc_region){
+    
+    # split
+    lb_region <- lb |> filter(mc_code == mc_region)
+    splits <- initial_time_split(lb_region, prop = 0.80)
+    
+    # models 
+    
+      # Model 1: auto_arima ----
+      model_fit_arima_no_boost <-
+          arima_reg() |>
+          set_engine(engine = "auto_arima") |>
+          fit(qtt ~ date, data = training(splits))
+      
+  
+      # Model 2: arima_boost ----
+      model_fit_arima_boosted <- 
+        arima_boost(
+          min_n = 2,
+          learn_rate = 0.015)  |> 
+          set_engine(engine = "auto_arima_xgboost") |> 
+          fit(qtt ~ date + 
+                    as.numeric(date) + 
+                    factor(month(date, 
+                                 label = TRUE),
+                           ordered = F),
+              data = training(splits))
+      
+      # Model 3: ets ----
+      model_fit_ets <- exp_smoothing() |>
+          set_engine(engine = "ets") |>
+          fit(qtt ~ date, data = training(splits))
+      
+      # Model 4: prophet ----
+      model_fit_prophet <- prophet_reg() |>
+          set_engine(engine = "prophet") |>
+          fit(qtt ~ date, data = training(splits))
+      
+      
+      # Model 5: lm ----
+      model_fit_lm <- linear_reg() |>
+          set_engine("lm") |>
+          fit(qtt ~ as.numeric(date) + 
+                      factor(month(date, label = TRUE), 
+                             ordered = FALSE),
+              data = training(splits))
+      
+      # Model 6: earth ----
+      
+      model_spec_mars <- mars(mode = "regression") |>
+          set_engine("earth") 
+      
+      recipe_spec <- recipe(qtt ~ date, data = training(splits)) |>
+          step_date(date, features = "month", ordinal = FALSE) |>
+          step_mutate(date_num = as.numeric(date)) |>
+          step_normalize(date_num) |>
+          step_rm(date)
+        
+      wflw_fit_mars <- workflow() |>
+          add_recipe(recipe_spec) |>
+          add_model(model_spec_mars) |>
+          fit(training(splits))
+    
+    # table with models
+      
+    models_tbl <- 
+      modeltime_table(
+        model_fit_arima_no_boost,
+        model_fit_arima_boosted,
+        model_fit_ets,
+        model_fit_prophet,
+        model_fit_lm,
+        wflw_fit_mars)
+    
+    calibration_tbl <- 
+      models_tbl |>
+      modeltime_calibrate(new_data = testing(splits))
+    
+    # evaluating the best model 
+    
+    min_mape <- calibration_tbl |> 
+                modeltime_accuracy() |> 
+                slice_min(mape, n = 1)
+    
+    refit_tbl <- calibration_tbl |>
+                    modeltime_refit(data = lb_region) |>
+                    filter(.model_id == min_mape$.model_id)
+    
+date_i <- x[["x"]][["data"]][[1]][["x"]]
+qtt_i <- x[["x"]][["data"]][[1]][["y"]]   
+    
+date <- x[["x"]][["data"]][[2]][["x"]]
+qtt <- x[["x"]][["data"]][[2]][["y"]]
+
+
+region_selected <- lb |> filter(mc_code == mc_region)
+
+region_name <- region_selected$macrorregiao
+state <- region_selected$state
+
+df_real <- tibble(mc_region = mc_region,
+                  region_name = region_name,
+                  state = state,
+                  mape = "real data",
+                  id = "real data",
+                  desc = "real data",
+                  date = date_i,
+                  qtt = round(qtt_i))
+
+
+df_projection <- tibble(mc_region = mc_region,
+                        region_name = region_name,
+                        state = state,
+                        mape = min_mape$mape,
+                        id = min_mape$.model_id,
+                        desc = min_mape$.model_desc,
+                        date = date,
+                        qtt = qtt)
+
+
+df <- rbind(df_real, df_projection)
+  
+}
+
+
+grafico <- function(df){
+  
+  df <- df
+  
+  region_name = df$mc_region
+  
+  graph <- 
+    df |> 
+    ggplot(aes(x = date, 
+               y = qtt, 
+               col = desc)) +
+    geom_line() + 
+    theme_minimal() + 
+    ggtitle(sprintf("Forecasting - %s - %s - %s", 
+                    region_name, state, reg)) +
+    theme(plot.background = 
+            element_rect(fill = "white", color = NA),
+          panel.background = element_rect(fill = "white", 
+                                          color = NA),
+          legend.position = "bottom")
+  
+
+
+}
+```
+
+Testando modelo
+
+```{r}
+
+#| warning: FALSE
+
+region_vector <- lb |> 
+                  filter(state == "GO") |> 
+                  distinct(mc_code)
+
+region_vector_go <- region_vector$mc_code
+
+region_test <- best_model(mc_region = "5210")
+
+grafico(region_test)
+
+
+```
