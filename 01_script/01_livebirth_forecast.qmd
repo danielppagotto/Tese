@@ -1,7 +1,8 @@
 ---
-title: "Forecasting live births"
+title: "01 - Forecasting live births"
 format: html
 editor: visual
+toc: true
 ---
 
 This script aims to describe the process of applying the method for forecasting the number of live births (LB) in each health macro-region in Brazil. To do this, we will use data from the Live Births System (SINASC, *Sistema de Nascidos Vivos*) provided by the SUS Information Technology Department (DATASUS) for each health macro-region.
@@ -214,7 +215,7 @@ splits
 
 ## 2) Fit models
 
-Nós construímos
+We built an object containing various forecasting models, including Autoregressive Integrated Moving Average (ARIMA), ARIMA with XGBoost, Prophet, Exponential Smoothing (ETS) and Multivariate Adaptive Regression Splines (MARS).
 
 ```{r}
 #| warning: false
@@ -241,18 +242,21 @@ model_fit_arima_boosted <-
         data = training(splits))
 
 # Model 3: ets ----
-model_fit_ets <- exp_smoothing() |>
+model_fit_ets <- 
+  exp_smoothing() |>
     set_engine(engine = "ets") |>
     fit(qtt ~ date, data = training(splits))
 
 # Model 4: prophet ----
-model_fit_prophet <- prophet_reg() |>
+model_fit_prophet <- 
+  prophet_reg() |>
     set_engine(engine = "prophet") |>
     fit(qtt ~ date, data = training(splits))
 
 
 # Model 5: lm ----
-model_fit_lm <- linear_reg() |>
+model_fit_lm <- 
+  linear_reg() |>
     set_engine("lm") |>
     fit(qtt ~ as.numeric(date) + 
                 factor(month(date, 
@@ -262,16 +266,19 @@ model_fit_lm <- linear_reg() |>
 
 # Model 6: earth ----
 
-model_spec_mars <- mars(mode = "regression") |>
+model_spec_mars <- 
+  mars(mode = "regression") |>
     set_engine("earth") 
 
-recipe_spec <- recipe(qtt ~ date, data = training(splits)) |>
+recipe_spec <- 
+  recipe(qtt ~ date, data = training(splits)) |>
     step_date(date, features = "month", ordinal = FALSE) |>
     step_mutate(date_num = as.numeric(date)) |>
     step_normalize(date_num) |>
     step_rm(date)
   
-wflw_fit_mars <- workflow() |>
+wflw_fit_mars <- 
+  workflow() |>
     add_recipe(recipe_spec) |>
     add_model(model_spec_mars) |>
     fit(training(splits))
@@ -290,25 +297,28 @@ models_tbl
 
 ```
 
-Add fitted models to model table
+## 3) Model evaluation
+
+For each of the models listed above, we have analyzed which models have the greatest predictive capacity. First, we just make a visual comparison.
 
 ```{r}
 
 calibration_tbl <- 
     models_tbl |>
-    modeltime_calibrate(new_data = 
-                          testing(splits))
+    modeltime_calibrate(new_data = testing(splits))
 
 calibration_tbl |>
     modeltime_forecast(
         new_data  = testing(splits),
         actual_data = lb5210) |>
     plot_modeltime_forecast(.conf_interval_show = FALSE)
+
 ```
 
-## 3) Model evaluation
+Next, we evaluated which models perform best using error metrics. Taking the Mean Absolut Percentage Error (MAPE) as a reference, the best model is the one with the lowest errors, i.e. ARIMA with XGBoost.
 
 ```{r}
+
 calibration_tbl |>
     modeltime_accuracy() |>
     table_modeltime_accuracy()
@@ -317,15 +327,19 @@ min_mape <- calibration_tbl |>
                 modeltime_accuracy() |> 
                 slice_min(mape, n = 1)
 
-?slice_min
+
 ```
 
-adfa
+We retrain the model, now with all the data, including the test dataset. In addition, we apply a projection for the next 3 years using the best model. We saved the model and the projections to plot in a graph at the end.
 
 ```{r}
-refit_tbl <- calibration_tbl |>
+
+# Refit model using training and test dataset
+refit_tbl <- 
+    calibration_tbl |>
     modeltime_refit(data = lb5210)
 
+# Projection of 3 years
 refit_tbl |>
     modeltime_forecast(h = "3 years", 
                        actual_data = lb5210) |>
@@ -333,7 +347,10 @@ refit_tbl |>
       .conf_interval_show = FALSE,
       .legend_max_width = 25)
 
-x <- refit_tbl |> 
+# Creating a temporary object temp to save the best model's output
+
+temp <- 
+  refit_tbl |> 
   filter(.model_id == min_mape$.model_id) |> 
   modeltime_forecast(h = "3 years", 
                        actual_data = lb5210) |>
@@ -341,19 +358,20 @@ x <- refit_tbl |>
       .conf_interval_show = FALSE,
       .legend_max_width = 25)
 
-date_i <- x[["x"]][["data"]][[1]][["x"]]
-qtt_i <- x[["x"]][["data"]][[1]][["y"]]   
+date_i <- temp[["x"]][["data"]][[1]][["x"]]
+qtt_i <- temp[["x"]][["data"]][[1]][["y"]]   
     
-date <- x[["x"]][["data"]][[2]][["x"]]
-qtt <- x[["x"]][["data"]][[2]][["y"]]
+date <- temp[["x"]][["data"]][[2]][["x"]]
+qtt <- temp[["x"]][["data"]][[2]][["y"]]
 
 state_region <- lb |> 
-                  filter(mc_code == "5208")
+                  filter(mc_code == "5210")
 
 state <- unique(state_region$state)
 region_name <- unique(state_region$macrorregiao)
+mc_region <- unique(state_region$mc_code)
 
-df_real <- tibble(mc_region = "5208",
+df_real <- tibble(mc_region = "5210",
                   region_name = region_name,
                   state = state,
                   mape = "real data",
@@ -362,7 +380,7 @@ df_real <- tibble(mc_region = "5208",
                   date = date_i,
                   qtt = round(qtt_i))
 
-df_projection <- tibble(mc_region = "5208",
+df_projection <- tibble(mc_region = "5210",
                         region_name = region_name,
                         state = state,
                         mape = min_mape$mape,
@@ -371,8 +389,27 @@ df_projection <- tibble(mc_region = "5208",
                         date,
                         qtt)
 
+# creating an object with real data and projected data
+
 df <- rbind(df_real,
             df_projection)
+
+# saving the object into a directory
+
+filename <- 
+  sprintf("output %s - %s - %s.csv", 
+          mc_region, 
+          state, 
+          region_name)
+
+filepath <- 
+  file.path("~/GitHub/Tese/Tese/01_script/forecast_files",
+            filename)
+
+write.csv(df, filepath, row.names = FALSE)
+
+
+# Plotting forecast
 
 graph <- 
   df |> 
@@ -382,36 +419,48 @@ graph <-
   geom_line() + 
   theme_minimal() + 
   ggtitle(sprintf("Forecasting - %s - %s - %s", 
-                  region_name, state, reg)) +
-  theme(plot.background = element_rect(fill = "white", 
-                                       color = NA),
-        panel.background = element_rect(fill = "white", 
-                                        color = NA),
+                  mc_region, state, region_name)) +
+  theme(plot.background = 
+          element_rect(fill = "white", 
+                       color = NA),
+        panel.background = 
+          element_rect(fill = "white", 
+                       color = NA),
         legend.position = "bottom")
 
 graph
 
-ggsave(filename = 
-       sprintf("Graph - %s.png", reg), plot = graph, 
-       path = "~/GitHub/Tese/Tese/01_script/graph",
-       width = 10, height = 5)
+# Saving graph in .png format 
+
+  
+ggsave(filename = sprintf("Graph %s - %s - %s.png", 
+                          mc_region, 
+                          state,
+                          region_name), 
+     plot = graph, 
+     path = "~/GitHub/Tese/Tese/01_script/graph",
+     width = 10, height = 5)
 
 
 ```
 
 # B) Function to automate process
 
-Criando uma função para aplicar e manter o melhor modelo
+We created a function to apply and maintain the best trained model based on the experience expressed in section A.
 
 ```{r}
 #| warning: FALSE
 
 best_model <- 
+  
   function(mc_region){
     
     # split
-    lb_region <- lb |> filter(mc_code == mc_region)
-    splits <- initial_time_split(lb_region, prop = 0.80)
+    lb_region <- lb |> 
+      filter(mc_code == mc_region)
+    
+    splits <- initial_time_split(lb_region, 
+                                 prop = 0.80)
     
     # models 
     
@@ -445,30 +494,6 @@ best_model <-
           set_engine(engine = "prophet") |>
           fit(qtt ~ date, data = training(splits))
       
-      
-      # Model 5: lm ----
-      model_fit_lm <- linear_reg() |>
-          set_engine("lm") |>
-          fit(qtt ~ as.numeric(date) + 
-                      factor(month(date, label = TRUE), 
-                             ordered = FALSE),
-              data = training(splits))
-      
-      # Model 6: earth ----
-      
-      model_spec_mars <- mars(mode = "regression") |>
-          set_engine("earth") 
-      
-      recipe_spec <- recipe(qtt ~ date, data = training(splits)) |>
-          step_date(date, features = "month", ordinal = FALSE) |>
-          step_mutate(date_num = as.numeric(date)) |>
-          step_normalize(date_num) |>
-          step_rm(date)
-        
-      wflw_fit_mars <- workflow() |>
-          add_recipe(recipe_spec) |>
-          add_model(model_spec_mars) |>
-          fit(training(splits))
     
     # table with models
       
@@ -477,9 +502,7 @@ best_model <-
         model_fit_arima_no_boost,
         model_fit_arima_boosted,
         model_fit_ets,
-        model_fit_prophet,
-        model_fit_lm,
-        wflw_fit_mars)
+        model_fit_prophet)
     
     calibration_tbl <- 
       models_tbl |>
@@ -495,17 +518,27 @@ best_model <-
                     modeltime_refit(data = lb_region) |>
                     filter(.model_id == min_mape$.model_id)
     
-date_i <- x[["x"]][["data"]][[1]][["x"]]
-qtt_i <- x[["x"]][["data"]][[1]][["y"]]   
+temp <- 
+  refit_tbl |> 
+  filter(.model_id == min_mape$.model_id) |> 
+  modeltime_forecast(h = "3 years", 
+                       actual_data = lb_region) |>
+    plot_modeltime_forecast(
+      .conf_interval_show = FALSE,
+      .legend_max_width = 25)
+
+date_i <- temp[["x"]][["data"]][[1]][["x"]]
+qtt_i <- temp[["x"]][["data"]][[1]][["y"]]   
     
-date <- x[["x"]][["data"]][[2]][["x"]]
-qtt <- x[["x"]][["data"]][[2]][["y"]]
+date <- temp[["x"]][["data"]][[2]][["x"]]
+qtt <- temp[["x"]][["data"]][[2]][["y"]]
 
+state_region <- lb_region |> 
+                  filter(mc_code == mc_region)
 
-region_selected <- lb |> filter(mc_code == mc_region)
-
-region_name <- region_selected$macrorregiao
-state <- region_selected$state
+state <- unique(state_region$state)
+region_name <- unique(state_region$macrorregiao)
+mc_region <- unique(state_region$mc_code)
 
 df_real <- tibble(mc_region = mc_region,
                   region_name = region_name,
@@ -516,27 +549,51 @@ df_real <- tibble(mc_region = mc_region,
                   date = date_i,
                   qtt = round(qtt_i))
 
-
 df_projection <- tibble(mc_region = mc_region,
                         region_name = region_name,
                         state = state,
                         mape = min_mape$mape,
                         id = min_mape$.model_id,
                         desc = min_mape$.model_desc,
-                        date = date,
-                        qtt = qtt)
+                        date,
+                        qtt)
 
+# creating an object with real data and projected data
 
-df <- rbind(df_real, df_projection)
+df <- rbind(df_real,
+            df_projection)
   
+# saving the output file of projections
+
+filename <- 
+  sprintf("%s - %s.csv", 
+          mc_region, 
+          state, 
+          region_name)
+
+filepath <- 
+  file.path("~/GitHub/Tese/Tese/01_script/forecast_files",
+            filename)
+
+write.csv(df, filepath, row.names = FALSE)
+
+return(df)
+
 }
 
+```
+
+The following function plots the graph and saves it into a proper directory.
+
+```{r}
 
 grafico <- function(df){
   
   df <- df
   
-  region_name = df$mc_region
+  region_code = df$mc_region
+  region_name = df$region_name
+  region_state = df$state
   
   graph <- 
     df |> 
@@ -545,34 +602,125 @@ grafico <- function(df){
                col = desc)) +
     geom_line() + 
     theme_minimal() + 
-    ggtitle(sprintf("Forecasting - %s - %s - %s", 
-                    region_name, state, reg)) +
+    ggtitle(sprintf("Forecasting %s - %s - %s.png", 
+                            region_code, 
+                            region_state,
+                            region_name)) +
     theme(plot.background = 
-            element_rect(fill = "white", color = NA),
+            element_rect(fill = "white", 
+                         color = NA),
           panel.background = element_rect(fill = "white", 
                                           color = NA),
           legend.position = "bottom")
-  
 
+# saving the graphs in a proper directory
+    
+  ggsave(filename = sprintf("Graph %s - %s - %s.png", 
+                            region_code, 
+                            region_state,
+                            region_name), 
+       plot = graph, 
+       path = "~/GitHub/Tese/Tese/01_script/graph",
+       width = 10, height = 5)
+  
+  graph
 
 }
+
 ```
 
-Testando modelo
+# C) Forecasting all regions
 
-```{r}
+Using a looping structure, we automate the process using both functions from section B.
 
+```{r eval=FALSE}
 #| warning: FALSE
 
 region_vector <- lb |> 
-                  filter(state == "GO") |> 
-                  distinct(mc_code)
+                  distinct(mc_code)  
+    
 
-region_vector_go <- region_vector$mc_code
+region_vector <- region_vector$mc_code
 
-region_test <- best_model(mc_region = "5210")
+df_total <- data.frame()
 
-grafico(region_test)
+for(i in region_vector){
+  
+  df <- best_model(i)
+  
+  df_total <- rbind(df_total, df)
+  
+  grafico(df)
+  
+}
+
+```
+
+```{r eval=FALSE, include=FALSE}
 
 
+df_goias <- df_total
+df_mt <- df_total
+df_ms <- df_total
+df_to <- df_total
+df_ap <- df_total
+df_ac <- df_total
+df_rr <- df_total
+df_ro <- df_total
+df_pa <- df_total
+df_pr <- df_total
+df_sc <- df_total
+df_rs <- df_total
+df_df <- df_total
+df_am <- df_total
+df_ba <- df_total
+df_rn_se_pe <- df_total
+df_ma <- df_total
+df_pi <- df_total
+df_al <- df_total
+df_pb <- df_total
+df_es <- df_total
+df_rj <- df_total
+df_sp <- df_total
+df_mg <- df_total
+df_ce_pb <- df_total
+
+
+
+df_geral <- 
+  rbind(df_goias, df_mt, df_ms, df_df,
+        df_to, df_pa, df_am, df_ap, df_rr, df_ro, df_ac, df_ap,
+        df_mg, df_sp, df_rj, df_es, 
+        df_rs, df_sc, df_pr, 
+        df_rn_se_pe, df_ba, df_pi, df_ce_pb, df_ma, df_al)
+
+#write.csv(df_geral, "df_geral_previsoes.csv")
+
+```
+
+```{r include=FALSE}
+
+df_geral <- read_csv("~/GitHub/Tese/Tese/01_script/forecast_files/df_geral_previsoes.csv")
+
+df_total <- df_geral
+
+```
+
+# D) Final considerations
+
+Using the modeltime framework we automated the live birth forecast for 113 macro-regions in Brazil. We have acchieved low level errors. The following boxplot shows that the median percentage error is 5.62. Additionally, the third quantile corresponded to a percentage error of 7.24. Only six macro-regions had percentage errors between 10 and 14.
+
+```{r}
+mape <- 
+  df_total |> 
+  filter(mape != "real data")
+
+mape$mape <- as.numeric(mape$mape)
+
+mape |> 
+  ggplot(aes(x = mape)) + geom_boxplot() + 
+  coord_flip() + theme_minimal()
+
+  
+  
 ```
